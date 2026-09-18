@@ -1,737 +1,483 @@
+<div align="center">
+
 # 🔋 Embedded Device Lifecycle Platform
 
-서버·Updater·Bootloader를 통한 EVSE 펌웨어 배포·업데이트 기능과 EVSE·BMS 간 CAN 통신 기반의 충전 제어 기능을 결합한 **임베디드 장치 관리 플랫폼**입니다.
+### STM32 BMS · EVSE · LwM2M OTA 기반 임베디드 디바이스 생명주기 플랫폼
 
-서버와 Updater·Bootloader는 EVSE 펌웨어의 생애주기를 관리합니다. EVSE와 BMS는 CAN을 통해 충전 요청과 배터리 상태·충전 허가 정보를 교환하며, 안전 조건이 충족될 때 배터리 충전을 수행합니다.
+4S 배터리의 상태를 실시간으로 측정하고 안전한 충전 가능 여부를 판단한 뒤,<br>
+CAN으로 EVSE와 연동하고 원격 펌웨어 업데이트까지 확장한 STM32 기반 통합 프로젝트입니다.
 
-본 프로젝트에서 저는 **STM32F446RE 기반 4S BMS 하드웨어 및 펌웨어**를 담당했습니다. BMS는 배터리의 셀 전압·팩 전압·전류·온도를 주기적으로 측정하고, Fault와 통신 상태를 독립적으로 검증해 안전한 경우에만 EVSE에 충전을 허가합니다.
+**담당 영역: BMS 펌웨어 전체 설계 · 구현 · 하드웨어 브링업 · 통합 검증**
 
-> 현재 BMS 펌웨어는 OTA를 지원하지 않습니다.
-> CAN `0x203`으로 BMS OTA 진입 요청을 수신하면 `Not Supported` 응답을 반환합니다.
+</div>
 
-| 항목      | 내용                                 |
-| ------- | ---------------------------------- |
-| 전체 구성   | Server · Bootloader · EVSE · BMS   |
-| 담당 파트   | STM32F446RE 기반 4S BMS 하드웨어·펌웨어     |
-| 주요 기능   | 배터리 계측 · Fault 판단 · 충전 허가 · 릴레이 제어 |
-| 통신 방식   | EVSE ↔ BMS CAN 500kbps             |
-| 제어 방식   | 6상태 FSM + De-energize Fail-safe    |
-| 실행 환경   | Bare-metal Super Loop              |
-| 개발 기간   | 2026.08.04 ~ 2026.08.27            |
-| 프로젝트 형태 | Team Project                       |
+---
+
+## 📌 Project Overview
+
+이 프로젝트는 배터리 상태를 수집하는 데서 끝나지 않고, **측정 → 보호 판단 → 충전 제어 연동 → 상태 표시 → 진단 → 펌웨어 업데이트**로 이어지는 임베디드 디바이스의 전체 운용 흐름을 구현하는 것을 목표로 합니다.
+
+BMS는 STM32F446RE에서 4개 셀 전압, 팩 전류, 온도와 통신 상태를 감시합니다. 측정값으로 Fault와 SOC를 계산하고, 충전 허가 신호인 `charge_permit`와 BMS 측 직렬 릴레이를 안전 방향으로 제어합니다. EVSE와는 CAN 2.0A로 상태를 교환하며, 별도의 STM32F429ZI OTA 구성은 ESP8266·LwM2M·CoAP·Bootloader를 이용해 펌웨어 수명주기를 관리합니다.
+
+> BMS는 감시·판단과 2차 차단을 담당합니다. 셀 단위 물리 보호는 별도 4S 보호보드가 수행하며, 충전 경로의 최종 제어 권한은 EVSE에 있습니다.
+
+| 구성 | 대상 | 역할 | 실행 구조 |
+| --- | --- | --- | --- |
+| **BMS Firmware** | NUCLEO-F446RE | 4S 배터리 측정, Fault·SOC·FSM, 충전 허가, 직렬 릴레이, CAN | Bare-metal super-loop |
+| **EVSE Application** | NUCLEO-F429ZI | 충전기 상태 제어, BMS CAN 연동, 최종 릴레이 제어 | FreeRTOS / CMSIS-RTOS2 |
+| **OTA/Wi-Fi Package** | STM32F429ZI + ESP8266 | LwM2M `/5`, CoAP Block2 다운로드, Bank2 staging | CMSIS-RTOS2 package |
+| **EVSE Bootloader** | STM32F429ZI | 이미지 검증, 설치, Application jump | Bare-metal |
+| **OTA Platform** | Java / Embedded Linux | 장치 등록, DTLS-PSK, 펌웨어 상태·배포 API | Spring Boot + Leshan |
+
+### 기술 스택
+
+| 분류 | 기술 |
+| --- | --- |
+| MCU / Board | STM32F446RE, STM32F429ZI, NUCLEO-F446RE, NUCLEO-F429ZI |
+| Firmware | C, STM32 HAL/CMSIS, FreeRTOS, CMSIS-RTOS2 |
+| Build | CMake, Ninja, GNU Arm Embedded Toolchain |
+| Device Network | CAN 2.0A 500 kbps, UART, I2C, ADC + DMA |
+| OTA / Backend | ESP8266 AT, UDP, CoAP Block2, LwM2M 1.2, Wakaama, Leshan, DTLS-PSK |
+| Server | Java 21, Spring Boot, PostgreSQL, Flyway |
 
 ---
 
 ## 📂 Contents
 
-* [👨‍💻 담당 역할](#-담당-역할)
-* [🌳 개발 환경](#-개발-환경)
-* [🧩 System Architecture](#-system-architecture)
-* [📁 BMS Software Architecture](#-bms-software-architecture)
-* [⏱️ 주기 기반 스케줄러](#️-주기-기반-스케줄러)
-* [📏 배터리 계측](#-배터리-계측)
-* [⚙️ FSM 기반 충전 제어](#️-fsm-기반-충전-제어)
-* [🛡️ Fault 및 안전 설계](#️-fault-및-안전-설계)
-* [📡 EVSE–BMS CAN 통신](#-evsebms-can-통신)
-* [🔌 릴레이 Fail-safe 제어](#-릴레이-fail-safe-제어)
-* [🖥️ OLED·LED 상태 표시](#️-oledled-상태-표시)
-* [🔧 통신 및 주변장치 안정화](#-통신-및-주변장치-안정화)
-* [🧪 동작 검증](#-동작-검증)
-* [🛠️ 트러블슈팅](#️-트러블슈팅)
-* [📚 주요 소스 파일](#-주요-소스-파일)
+- [👨‍💻 My Contribution](#-my-contribution)
+- [🧩 System Architecture](#-system-architecture)
+- [⚙️ BMS Architecture](#️-bms-architecture)
+- [🛡️ Safety Control](#️-safety-control)
+- [📡 CAN Integration](#-can-integration)
+- [🔌 Hardware Interface](#-hardware-interface)
+- [🧪 Verification & Troubleshooting](#-verification--troubleshooting)
+- [📊 Implementation Results](#-implementation-results)
+- [🚀 Build & Run](#-build--run)
+- [📁 Repository Guide](#-repository-guide)
+- [⚠️ Known Limitations](#️-known-limitations)
 
 ---
 
-## 👨‍💻 담당 역할
+## 👨‍💻 My Contribution
 
-| 구분       | 담당 내용                                     |
-| -------- | ----------------------------------------- |
-| BMS 하드웨어 | 4S 배터리 전압·전류·온도 계측 회로 구성                  |
-| BMS 펌웨어  | 주기 스케줄러, Fault 판단, FSM, SOC, 릴레이 제어       |
-| 전압 계측    | ADC DMA 기반 누적 노드 전압 측정 및 셀별 전압 계산         |
-| 전류 계측    | INA226·ACS712 이중 전류 계측 및 보호 전류 선택         |
-| 온도 계측    | NTC 4채널 측정 및 최고 온도 기반 보호                  |
-| 보호 로직    | 셀 과전압·저전압, 팩 과전압·과전류, 과온, 센서 이상 보호        |
-| CAN 통신   | EVSE 명령 수신 및 BMS 상태·측정값·응답 송신             |
-| 충전 제어    | `charge_permit` 생성 및 PB5 릴레이 Fail-safe 제어 |
-| 상태 표시    | OLED 측정값·상태 표시, 3색 LED 상태 구분              |
-| 시스템 통합   | EVSE–BMS CAN 연동 및 충전 시퀀스 검증               |
+이 프로젝트에서 저는 **BMS 파트 전체를 담당**했습니다. STM32CubeMX 주변장치 설정부터 센서 드라이버, 주기 스케줄러, 보호 로직, SOC 추정, 상태 머신, CAN 프로토콜, OLED·LED·릴레이 제어, 진단 콘솔과 실보드 검증까지 BMS 펌웨어의 전 과정을 설계하고 구현했습니다.
 
----
+| 담당 영역 | 직접 설계·구현한 내용 |
+| --- | --- |
+| **System Architecture** | `app → dev → hw → HAL` 단방향 4계층 구조, 공용 블랙보드, RTOS 없는 협조형 super-loop |
+| **Voltage Sensing** | 4개 누적 셀 노드 ADC 측정, Vrefint 기반 VDDA 보정, 셀별 차분, 오버샘플링, 채널별 Q16 게인 캘리브레이션 |
+| **Current / Temperature** | INA226 팩 전류·버스 전압, ACS712 교차 검증·포화 대체, NTC 4채널 최고 온도 감시 |
+| **Safety Logic** | 8종 Fault 비트마스크, 3회 연속 확정, 히스테리시스, 해제 유지 시간, `charge_permit` fail-safe 제어 |
+| **BMS FSM** | `INIT → SELF_CHECK → IDLE → CHARGE_READY → CHARGING → FAULT` 상태 전이와 진입 조건 설계 |
+| **SOC Estimation** | 셀 평균 OCV 초기값, 1초 주기 쿨롱 카운팅, 무부하 IIR 재보정, 정수 고정소수점 연산 |
+| **CAN Protocol** | BMS 송신 `0x100~0x105`, EVSE 수신 `0x200~0x205`, DLC·범위 검사, 링크 타임아웃, 파라미터 응답 |
+| **Output / Diagnostics** | BMS 직렬 릴레이, 3색 상태 LED, SSD1306 OLED, USART2 명령 콘솔, POST·CAN·릴레이 트레이스 |
+| **Hardware Bring-up** | ADC·I2C·CAN·UART·GPIO 단계별 활성화, 셀 캘리브레이션, I2C 복구, 실보드 2대 CAN 통합 검증 |
 
-## 🌳 개발 환경
+### 설계에서 중점적으로 해결한 부분
 
-| 구분       | 내용                                       |
-| -------- | ---------------------------------------- |
-| MCU      | STM32F446RE                              |
-| IDE      | STM32CubeIDE / STM32CubeMX               |
-| Language | C                                        |
-| 실행 구조    | Bare-metal Super Loop + Tick 기반 주기 스케줄러  |
-| 통신       | CAN 500kbps · I2C · UART                 |
-| 주요 주변장치  | ADC DMA · GPIO · CAN · I2C · UART · Tick |
-| 전압 계측    | 분압 회로 + ADC 4채널                          |
-| 전류 계측    | INA226 + ACS712                          |
-| 온도 계측    | NTC Thermistor 4채널                       |
-| 출력 장치    | PB5 BMS Relay · OLED · 3색 LED            |
-| 배터리      | 4S Battery Pack + 4S Protection Board    |
-
-RTOS를 사용하지 않고 각 기능의 실행 주기를 분리한 Super Loop 구조로 구현했습니다. 센서 처리나 화면 출력이 안전 제어 루프를 지연시키지 않도록 작업별 실행 시점을 나눴습니다.
+- 센서값을 곧바로 제어에 사용하지 않고 `bms_data_t` 블랙보드에 모아 판단 흐름을 단일화
+- 한 번의 ADC 노이즈로 충전이 끊기지 않도록 Fault 진입 확정과 해제 히스테리시스를 분리
+- Fault 판정, FSM 진입 동작, 릴레이 출력에서 중복으로 안전 조건을 확인하는 fail-safe 구조 적용
+- INA226 션트 측정과 ACS712 홀 센서를 교차 검증하고, INA226 포화 시 대체 전류 경로 사용
+- CAN의 “통신 정상”과 “충전 요청”을 서로 다른 조건으로 취급해 잘못된 충전 진입 방지
+- 실제 계측값을 mV, mA, 0.1 °C 단위의 정수로 유지해 실행 시간과 코드 크기를 예측 가능하게 관리
+- 콘솔 POST·원시값 덤프·프레임 트레이스로 배선, 센서, 프로토콜 문제를 단계적으로 구분
 
 ---
 
 ## 🧩 System Architecture
 
-### 전체 플랫폼 구조
-
 ```mermaid
 flowchart LR
-    S["Server"]
-    U["Updater / Bootloader"]
-    E["EVSE"]
-    B["4S BMS"]
+    subgraph MINE[My Scope - BMS]
+        SENSORS[Cell ADC / INA226<br/>ACS712 / NTC] --> BMS[BMS Firmware<br/>STM32F446RE]
+        BMS --> LOCAL[OLED / LED<br/>Safety Relay]
+    end
 
-    S -->|"Firmware·Version 관리"| U
-    U --> E
-    E <-->|"CAN 500kbps"| B
+    BMS <-->|CAN 2.0A<br/>500 kbps| EVSE[EVSE Application<br/>STM32F429ZI]
+    EVSE --> POWER[Contactor / Charger]
+    EVSE <--> OTA[OTA-WiFi Package<br/>ESP8266 + LwM2M]
+    OTA <-->|CoAP / UDP<br/>DTLS control plane| SERVER[Spring Boot<br/>Embedded Leshan Server]
+    SERVER --> STORE[(PostgreSQL<br/>Firmware Artifact)]
+    OTA -->|Install request| BOOT[EVSE Bootloader]
+    BOOT -->|Verified image| EVSE
+
+    classDef mine fill:#e8f4ff,stroke:#1677ff,stroke-width:2px;
+    classDef system fill:#f5f5f5,stroke:#666,stroke-width:1px;
+    class SENSORS,BMS,LOCAL mine;
+    class EVSE,POWER,OTA,SERVER,STORE,BOOT system;
 ```
 
-서버·Updater·Bootloader는 EVSE 펌웨어의 배포와 업데이트를 담당하며, EVSE는 서버와 연동해 펌웨어를 관리하고 충전 요청 및 전원 경로를 제어합니다.
+- 파란색 영역: 직접 담당한 BMS 하드웨어 인터페이스와 펌웨어
+- 회색 영역: CAN 및 OTA로 연동되는 플랫폼 구성요소
+- BMS와 EVSE는 서로 다른 MCU에서 동작하며, 소스가 아니라 CAN 프레임 규격만 공유합니다.
+- 현재 BMS OTA는 지원하지 않습니다. BMS는 `0x203` OTA 진입 요청에 미지원 응답을 반환합니다.
 
-BMS는 EVSE와 CAN 통신으로 연결되어 배터리의 전압·전류·온도를 측정하고 안전 상태를 판단합니다. 판단 결과인 충전 허가(charge_permit)를 EVSE에 전달하며, EVSE와 BMS의 조건이 모두 충족될 때 배터리 충전을 수행합니다.
-
-### 충전 전력 경로
+### 전체 데이터 흐름
 
 ```text
-12V Adapter
-    → LTC3780 승압 모듈
-    → EVSE Relay
-    → INA226
-    → ACS712
-    → BMS Relay
-    → 4S Protection Board
-    → 4S Battery Pack
+Cell / Current / Temperature
+            ↓
+        Measurement
+            ↓
+      bms_data_t Blackboard
+       ├─ Fault 판단 ───────→ charge_permit ─→ BMS Relay
+       ├─ SOC 추정
+       ├─ BMS FSM ──────────→ LED / OLED
+       └─ CAN Packing ──────→ EVSE ─→ Charger / UI
+
+EVSE Status / Charge Request / E-Stop
+            └──────── CAN ───────────→ BMS FSM + Link Monitor
 ```
-
-### BMS 제어 흐름
-
-```text
-센서 계측
-    → 측정값 보정 및 유효성 확인
-    → Fault·Warning 판단
-    → FSM 상태 갱신
-    → charge_permit 생성
-    → BMS Relay 제어
-    → CAN·OLED·LED 상태 출력
-```
-
-### 설계 의도
-
-* **EVSE의 충전 요청을 그대로 실행하지 않음**
-  EVSE에서 충전 시작 요청이 들어오더라도 BMS가 배터리와 통신 상태를 다시 확인합니다.
-
-* **요청과 허가를 분리**
-  EVSE의 `charge_req`와 BMS의 `charge_permit`이 모두 유효해야 충전 가능한 FSM 상태로 진입합니다.
-
-* **통신 이상도 보호 조건에 포함**
-  배터리 측정값이 정상이더라도 CAN 연결이 끊기면 이전 충전 요청을 폐기하고 충전을 중단합니다.
-
-* **전원·통신·센서 이상 시 안전 상태로 수렴**
-  유효한 ON 조건을 유지할 수 없으면 PB5의 Normally Open 릴레이가 개방 상태로 돌아가도록 설계했습니다.
 
 ---
 
-## 📁 BMS Software Architecture
+## ⚙️ BMS Architecture
 
-BMS 코드는 역할에 따라 `app`, `dev`, `hw`, `common` 계층으로 구분했습니다.
+📂 [`Embedded_Lifecycle_Device_BMS_Final/`](Embedded_Lifecycle_Device_BMS_Final/)
+
+### 4계층 단방향 의존 구조
 
 ```text
-BMS/
-├── app/
-│   ├── bms_app.c          # 주기 스케줄러 및 BMS 전체 실행 흐름
-│   ├── bms_can.c          # CAN 수신·송신·응답 처리
-│   ├── bms_state.c        # 6상태 FSM 및 충전 상태 전이
-│   ├── bms_fault.c        # Fault·Warning 판단 및 복구
-│   └── bms_ui.c           # OLED·LED 상태 표시
-│
-├── common/
-│   ├── bms_cfg.h          # CAN ID, 보호 기준 및 설정값
-│   └── bms_types.h        # 상태, Fault, 데이터 구조 정의
-│
-├── dev/
-│   ├── Cell ADC
-│   ├── INA226
-│   ├── ACS712
-│   ├── NTC
-│   ├── OLED
-│   └── LED
-│
-└── hw/
-    ├── ADC
-    ├── I2C
-    ├── GPIO
-    ├── UART
-    └── Tick
+Core/main.c
+    └─ BMS/app      주기 스케줄러, 블랙보드, Fault, SOC, FSM, CAN, UI
+         └─ BMS/dev 장치 드라이버: Cell ADC, INA226, ACS712, NTC, OLED, LED
+              └─ BMS/hw  ADC, I2C, UART, GPIO, Tick, Debug HAL wrapper
+                   └─ STM32 HAL / CMSIS
 ```
 
-| 계층       | 역할                                 |
-| -------- | ---------------------------------- |
-| `app`    | BMS 제어 흐름, Fault, FSM, CAN, UI 구현  |
-| `common` | CAN ID, 보호 설정값, 공통 자료형 정의          |
-| `dev`    | 센서와 출력 장치를 기능 단위로 추상화              |
-| `hw`     | ADC, I2C, GPIO, UART, Tick 하드웨어 접근 |
+상위 계층은 하위 계층만 호출합니다. 애플리케이션 판단 코드가 HAL handle이나 레지스터를 직접 알지 않도록 분리해, 센서 교체와 하드웨어 디버깅이 보호 로직에 번지는 것을 줄였습니다.
 
-CAN 전용 `hw` 래퍼는 사용하지 않습니다. `[bms_can.c](BMS/app/bms_can.c)`가 CubeMX에서 생성된 `hcan1`과 STM32 HAL CAN API를 직접 사용합니다.
+전역 운용 상태는 [`bms_app.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_app.c)의 `static bms_data_t s_bms` 한 곳에만 존재합니다. `ap_collect()`가 장치 계층의 값을 수집하고 Fault·SOC·FSM·UI·CAN 모듈은 이 스냅샷을 읽습니다.
+
+### 협조형 super-loop 스케줄
+
+| 실행 주기 | 처리 내용 |
+| --- | --- |
+| 매 loop | CAN RX FIFO 폴링, UART 콘솔 입력 처리 |
+| 100 ms | 센서값 수집 → Fault → FSM → 릴레이 → LED → CAN `0x100`, `0x103` |
+| 500 ms | NTC 갱신, OLED 갱신, CAN `0x101`, `0x102` |
+| 1,000 ms | SOC 적산, CAN `0x104`, CAN 통계, 상태 요약 로그 |
+
+CAN RX는 인터럽트 알림 대신 main loop에서 FIFO를 계속 비웁니다. 주기 task에 RX를 묶지 않아 3단 FIFO가 100 ms 동안 쌓여 넘치는 상황을 방지했습니다.
+
+### 센서 처리
+
+| 측정 항목 | 처리 방식 |
+| --- | --- |
+| Cell 1~4 | B1/B2/B3/B+ 누적 노드를 ADC1 + DMA로 측정한 뒤 인접 노드를 차분 |
+| VDDA | 내부 Vrefint factory calibration 값으로 실제 ADC 기준 전압 보정 |
+| Pack Voltage | 셀 ADC의 B+ 누적 노드를 팩 전압 기준으로 사용 |
+| Pack Current | INA226 션트 전류를 기본값으로 사용하고 포화 구간은 ACS712로 대체 |
+| Temperature | NTC 4채널 가운데 유효한 채널의 최고 온도를 보호 판단에 사용 |
+| SOC | 셀 평균 OCV로 초기화한 뒤 팩 전류를 1초마다 적산 |
+
+SOC 내부값은 0.01% 해상도로 보관합니다. 전류 절댓값이 30 mA보다 크면 쿨롱 카운팅을 수행하고, 무부하에서는 OCV 값으로 천천히 수렴시켜 장기 오차를 보정합니다.
 
 ---
 
-## ⏱️ 주기 기반 스케줄러
+## 🛡️ Safety Control
 
-`[bms_app.c](BMS/app/bms_app.c)`에서 Tick을 기준으로 100ms, 500ms, 1000ms 작업을 구분했습니다.
-
-| 실행 주기  | 수행 기능                                                       |
-| ------ | ----------------------------------------------------------- |
-| 100ms  | 셀 ADC, INA226, ACS712, Fault, FSM, Relay, CAN `0x100/0x103` |
-| 500ms  | NTC, OLED, CAN `0x101/0x102`                                |
-| 1000ms | SOC, 버전, 콘솔 출력, CAN 통계                                      |
-
-### 100ms 안전 제어 흐름
-
-```text
-Cell ADC
-    → INA226 / ACS712
-    → Fault Check
-    → FSM Update
-    → Relay Control
-    → CAN 0x100 / 0x103
-```
-
-센서 계측 이후 Fault를 먼저 판단하고, 그 결과를 FSM과 릴레이 제어에 반영합니다. 릴레이를 먼저 제어한 뒤 Fault를 확인하면서 발생할 수 있는 한 주기 지연을 방지했습니다.
-
-### 500ms 상태 갱신
-
-```text
-NTC 측정
-    → 최고 온도 갱신
-    → OLED 화면 갱신
-    → CAN 0x101 / 0x102
-```
-
-온도와 화면 표시는 500ms마다 갱신해 100ms 안전 제어 루프의 실행 시간을 침범하지 않도록 했습니다.
-
-### 1000ms 진단 작업
-
-```text
-SOC 계산
-    → 버전 정보 갱신
-    → 콘솔 상태 출력
-    → CAN 통계 출력
-```
-
-주기가 길어도 되는 진단·표시 기능은 1000ms 작업으로 분리했습니다.
-
----
-
-## 📏 배터리 계측
-
-### ① ADC DMA 16회 오버샘플링
-
-셀 전압은 ADC DMA를 이용해 각 채널을 반복 측정하고, **16개 샘플의 평균값**을 사용합니다.
-
-한 번의 ADC 값으로 전압을 결정하지 않고 여러 샘플을 평균내 순간 노이즈의 영향을 줄였습니다.
-
-```text
-ADC DMA 수집
-    → 채널별 16개 Sample 누적
-    → 평균 ADC 값 계산
-    → VDDA 보정
-    → 실제 누적 전압 변환
-```
-
-### ② VREFINT 기반 VDDA 보정
-
-ADC 변환 시 기준전압을 항상 고정된 3.3V로 가정하지 않고, STM32 내부 기준전압인 `VREFINT`를 이용해 실제 VDDA를 계산합니다.
-
-전원전압이 조금 변하더라도 보정된 VDDA를 ADC 환산에 적용해 셀 전압 계산 오차를 줄였습니다. 계산된 VDDA는 OLED에도 표시해 ADC 기준전압 상태를 확인할 수 있도록 했습니다.
-
-### ③ 4S 셀 전압 산출
-
-4개의 ADC 채널은 각 셀의 개별 전압이 아니라 배터리 음극을 기준으로 한 **누적 노드 전압**을 측정합니다.
-
-```text
-P1 = Cell 1까지의 누적 전압
-P2 = Cell 1 + Cell 2 누적 전압
-P3 = Cell 1 + Cell 2 + Cell 3 누적 전압
-P4 = 전체 4S Pack 전압
-```
-
-각 셀의 전압은 인접한 누적 노드의 차로 계산합니다.
-
-```text
-Cell 1 = P1
-Cell 2 = P2 - P1
-Cell 3 = P3 - P2
-Cell 4 = P4 - P3
-
-Pack Voltage = P4
-```
-
-누적 노드 방식은 하나의 접점이 불안정하면 이후 셀 계산값도 함께 틀어질 수 있습니다. 따라서 셀별 결과뿐 아니라 P1~P4 원시 누적 전압의 범위와 순서도 함께 확인합니다.
-
-### ④ INA226·ACS712 이중 전류 계측
-
-팩 전류는 INA226과 ACS712 두 센서로 측정합니다.
-
-| 센서     | 계측 방식              | 역할                  |
-| ------ | ------------------ | ------------------- |
-| INA226 | 션트 저항 전압을 I2C로 측정  | 정상 범위의 주 전류 계측      |
-| ACS712 | 홀 효과 기반 아날로그 출력 측정 | 보조 전류 계측 및 보호 경로 대체 |
-
-평상시에는 INA226 값을 대표 전류로 사용합니다. INA226가 측정 가능한 범위를 벗어나 포화된 경우에는 보호 판단에 사용할 전류를 ACS712 값으로 전환합니다.
-
-```text
-INA226 정상
-    → INA226 전류 사용
-
-INA226 포화 또는 유효하지 않음
-    → ACS712 전류로 보호 경로 전환
-```
-
-INA226의 측정 범위를 넘는 전류가 들어왔을 때 값이 더 이상 증가하지 않는 문제를 보조 센서로 보완했습니다.
-
-### ⑤ NTC 4채널 온도 계측
-
-배터리 각 셀 주변에 NTC 4채널을 배치했습니다.
-
-보호 판단에는 평균 온도가 아니라 **4개 채널 중 가장 높은 온도**를 사용합니다. 특정 셀만 빠르게 가열되는 상황이 평균값에 가려지지 않도록 하기 위한 설계입니다.
-
-```text
-NTC 1~4 측정
-    → 각 채널 온도 변환
-    → 최대 온도 선택
-    → 과온 Fault 판단
-```
-
-### ⑥ 셀 편차 및 SOC
-
-최대 셀 전압과 최소 셀 전압의 차이를 계산해 셀 편차를 확인합니다.
-
-셀 불균형은 즉시 충전을 차단하는 Critical Fault가 아니라 Warning으로 분리했습니다. SOC는 별도 주기로 계산해 OLED와 CAN을 통해 전달합니다.
-
----
-
-## ⚙️ FSM 기반 충전 제어
-
-충전 동작은 단순 ON/OFF 조건문이 아니라 6개의 상태로 관리합니다.
+### BMS 상태 머신
 
 ```mermaid
 stateDiagram-v2
     [*] --> INIT
     INIT --> SELF_CHECK
-    SELF_CHECK --> IDLE
-    IDLE --> CHARGE_READY
-    CHARGE_READY --> CHARGING
-    CHARGING --> IDLE
-
-    INIT --> FAULT
-    SELF_CHECK --> FAULT
-    IDLE --> FAULT
-    CHARGE_READY --> FAULT
-    CHARGING --> FAULT
-    FAULT --> IDLE
+    SELF_CHECK --> IDLE: Sensor and cell range valid
+    SELF_CHECK --> FAULT: Self-check failed
+    IDLE --> CHARGE_READY: Permit + Link + Request + Connected
+    CHARGE_READY --> CHARGING: Conditions held for 1 second
+    CHARGE_READY --> IDLE: Stop / Disconnect / E-Stop
+    CHARGING --> IDLE: Stop / Disconnect / E-Stop
+    IDLE --> FAULT: Critical fault
+    CHARGE_READY --> FAULT: Critical fault
+    CHARGING --> FAULT: Critical fault
+    FAULT --> IDLE: Critical faults cleared
 ```
 
-| 상태             | 역할                             |
-| -------------- | ------------------------------ |
-| `INIT`         | BMS 주변장치와 내부 변수 초기화, Relay OFF |
-| `SELF_CHECK`   | 센서와 초기 상태의 정상 여부 확인            |
-| `IDLE`         | 충전 요청 대기, Relay OFF            |
-| `CHARGE_READY` | EVSE 요청과 BMS 안전 조건 최종 확인       |
-| `CHARGING`     | 유효한 조건이 유지되는 동안 충전 수행          |
-| `FAULT`        | 충전 허가 제거 및 Relay OFF 유지        |
+| 상태 | 의미 | BMS 릴레이 |
+| --- | --- | --- |
+| `INIT` | 주변장치 초기화 | OPEN |
+| `SELF_CHECK` | 센서 준비 상태와 셀 전압 범위 확인 | OPEN |
+| `IDLE` | 배터리 감시, EVSE 요청 대기 | OPEN |
+| `CHARGE_READY` | 모든 충전 조건 만족, 출력 안정화 대기 | CLOSE |
+| `CHARGING` | 충전 요청이 유지되는 상태 | CLOSE |
+| `FAULT` | Critical Fault 발생, 충전 금지 | OPEN |
 
-`CHARGE_READY` 진입 과정에서는 다음 조건을 확인합니다.
+BMS 릴레이는 `charge_permit=1`이면서 상태가 `CHARGE_READY` 또는 `CHARGING`일 때만 닫힙니다. 릴레이 GPIO는 매 100 ms마다 다시 기록하므로 출력 latch가 노이즈로 흐트러져도 안전 지령으로 복귀합니다.
 
-```text
-charge_permit
-&& link_ok
-&& charge_req
-&& connected
-&& !e_stop
-```
+### Fault 정책
 
-Critical Fault는 어느 상태에서든 `FAULT` 진입을 우선시합니다. Fault가 해제된 후에는 바로 충전을 재개하지 않고 `IDLE`로 복귀해 새로운 EVSE 요청과 현재 안전 조건을 다시 확인합니다.
+| Bit | Fault | 진입 기준 | 해제 기준 | 등급 |
+| ---: | --- | --- | --- | --- |
+| `0x01` | `CELL_OV` | 셀 > 4,200 mV | 모든 셀 < 4,150 mV | Critical |
+| `0x02` | `CELL_UV` | 셀 < 3,000 mV | 모든 셀 > 3,100 mV | Critical |
+| `0x04` | `PACK_OV` | 팩 > 16,800 mV | 팩 < 16,600 mV | Critical |
+| `0x08` | `OVER_CURRENT` | `|I|` > 1,000 mA, Demo | `|I|` < 900 mA | Critical |
+| `0x10` | `OVER_TEMP` | 최고 NTC > 55.0 °C | < 50.0 °C | Critical |
+| `0x20` | `SENSOR_ERR` | 센서 미준비 또는 전류 센서 차이 > 500 mA | 센서 정상 / 대체 조건 | Critical |
+| `0x40` | `LINK_TIMEOUT` | EVSE 유효 프레임 1초간 없음 | 정상 프레임 300 ms 유지 | Critical |
+| `0x80` | `IMBALANCE` | 셀 편차 > 150 mV | 편차 ≤ 150 mV | Warning |
+
+- Critical Fault는 기본적으로 100 ms 샘플 3회 연속 확인 후 확정합니다.
+- 배터리·센서 Fault의 해제 조건은 3초간 유지되어야 하며, CAN 링크 복구는 300 ms를 사용합니다.
+- `IMBALANCE`는 경고이므로 단독 발생 시 충전을 차단하지 않습니다.
+- 상위 노드는 `fault == 0`이 아니라 반드시 `charge_permit`를 기준으로 충전 가능 여부를 판단합니다.
+- Fault가 확정된 같은 100 ms slot 안에서 `charge_permit=0`, 릴레이 개방, CAN 상태 전송까지 처리합니다.
 
 ---
 
-## 🛡️ Fault 및 안전 설계
+## 📡 CAN Integration
 
-### 주요 보호 항목
+BMS와 EVSE의 유일한 결합 지점은 CAN 프레임 계약입니다.
 
-| 보호 항목       | 판단 내용                    | 제어 결과                 |
-| ----------- | ------------------------ | --------------------- |
-| 셀 과전압·저전압   | Cell 1~4 중 하나라도 허용 범위 이탈 | Critical Fault, 충전 차단 |
-| 팩 과전압       | 전체 4S Pack 전압 한계 초과      | Critical Fault, 충전 차단 |
-| 과전류         | 선택된 대표 전류가 설정 범위 초과      | Critical Fault, 충전 차단 |
-| 과온          | NTC 4채널 중 최고 온도 한계 초과    | Critical Fault, 충전 차단 |
-| 센서 이상       | 측정 실패, 포화 또는 유효 범위 이탈    | 보호 경로 전환 또는 Fault     |
-| CAN Timeout | 일정 시간 동안 EVSE 메시지 미수신    | 요청 무효화, 충전 차단         |
-| 셀 불균형       | 최대·최소 셀 전압 편차 초과         | Warning 표시            |
+| 항목 | 설정 |
+| --- | --- |
+| Protocol | CAN 2.0A, Standard 11-bit ID |
+| Bitrate | 500 kbps |
+| Timing | PCLK1 42 MHz / Prescaler 6 / BS1 11 TQ / BS2 2 TQ |
+| Sample Point | 85.7% |
+| Byte Order | Multi-byte Little Endian |
+| Transceiver | SN65HVD230, 3.3 V |
 
-### Fault 3회 연속 확인
+### BMS → EVSE
 
-ADC와 센서값은 순간적인 노이즈로 한 번씩 임계값을 벗어날 수 있습니다. 측정 한 번만으로 Fault를 확정하면 정상 상태에서도 릴레이가 반복적으로 동작할 수 있습니다.
+| ID | 주기 | DLC | Payload |
+| ---: | ---: | ---: | --- |
+| `0x100` | 100 ms | 8 | Pack V 0.01 V, Pack I 0.01 A, SOC, Permit, State, Fault |
+| `0x101` | 500 ms | 8 | Cell 1~4, 각 `int16` mV |
+| `0x102` | 500 ms | 8 | 최고 온도 0.1 °C, 셀 편차, Cell Min, Cell Max |
+| `0x103` | 100 ms | 2 | State, Fault 축약 프레임 |
+| `0x104` | 1 s | 4 | Firmware Major, Minor, OTA/Reserved 현재 `0` |
+| `0x105` | 응답 시 | 4 | 응답 코드, 상세 코드, 적용값 |
 
-이를 방지하기 위해 100ms 주기의 이상 값을 3회 연속 확인합니다.
+### EVSE → BMS
+
+| ID | DLC | Payload / 처리 |
+| ---: | ---: | --- |
+| `0x200` | 4 | EVSE State, Relay, Connector, E-Stop; heartbeat 겸용 |
+| `0x201` | 1 | 충전 중지/시작 요청 |
+| `0x202` | 1 | EVSE Fault |
+| `0x203` | 0 | BMS OTA 진입 요청; 현재 미지원 응답 |
+| `0x205` | 4 | Parameter ID, `int16` 값, Magic `0xA5` |
+
+EVSE 수신부는 DLC와 값 범위를 정확하게 검사하므로 프레임 길이·상태 enum·Fault bit를 바꾸면 양쪽 정의를 함께 수정해야 합니다. BMS는 부팅 시 CAN 클럭으로 실제 bitrate를 계산해 500 kbps와 1% 이상 차이나면 오류를 출력하고, 원격 프레임(RTR)은 양쪽 모두 폐기합니다.
+
+### 실보드 연동
+
+NUCLEO-F446RE BMS와 NUCLEO-F429ZI EVSE를 SN65HVD230으로 연결해 양방향 CAN 링크를 확인했습니다. BMS 콘솔의 프레임 trace와 `TEC/REC/LEC` 통계를 이용해 다음 순서로 문제를 구분했습니다.
 
 ```text
-이상 값 1회 → 확인 중
-이상 값 2회 → 확인 중
-이상 값 3회 → Fault 확정
+TX 증가 + TEC 0       → 상대 노드 ACK, 물리 계층 정상
+TX 증가 + TEC 증가    → 상대 미기동 / bitrate / 종단 저항 확인
+RX 0                  → 상대 송신 설정과 CAN enable 확인
+BIT / STUFF Error      → 공통 GND, Rs 핀, CANH/CANL 배선 확인
 ```
-
-이상 상태가 약 300ms 동안 지속되면 Fault로 확정하고, **Fault 확정 직후** `charge_permit`을 해제합니다.
-
-### 비대칭 Fault 복구
-
-Fault 진입과 해제에 동일한 단일 임계값을 사용하면 측정값이 경계 부근에서 움직일 때 Fault가 반복해서 설정·해제될 수 있습니다.
-
-이를 방지하기 위해 진입과 해제 조건을 다르게 구성했습니다.
-
-* Fault 진입: 이상 값 3회 연속 확인
-* Fault 해제: 복구 임계값에 히스테리시스 적용
-* 일반 Fault 해제: 정상 상태 3초 유지
-* Fault 해제 후: `IDLE` 상태로 복귀
-* 충전 재개: 새로운 요청과 모든 안전 조건 재검증
-
-### Warning과 Critical Fault 분리
-
-셀 편차를 나타내는 `IMBALANCE`는 Warning으로 구분합니다.
-
-다음과 같이 모든 Fault bit를 충전 차단 조건으로 사용하지 않습니다.
-
-```c
-if (fault != 0)
-{
-    charge_permit = 0;
-}
-```
-
-Warning까지 모두 충전 차단에 포함하면 실제 위험 상태가 아닌데도 충전이 중단될 수 있습니다.
-
-따라서 `[bms_types.h](BMS/common/bms_types.h)`와 `[bms_fault.c](BMS/app/bms_fault.c)`에서 Warning과 Critical Fault를 분리하고, **Critical Fault만 `charge_permit`을 차단**하도록 구성했습니다.
 
 ---
 
-## 📡 EVSE–BMS CAN 통신
+## 🔌 Hardware Interface
 
-EVSE와 BMS는 CAN 500kbps로 충전 요청, 장치 상태, Fault, 측정값과 제어 응답을 교환합니다.
+### BMS Pin Map
 
-### EVSE → BMS 수신 ID
+| MCU Pin | Peripheral | 용도 |
+| --- | --- | --- |
+| PA0 / PA1 / PA4 / PB0 | ADC1 IN0 / IN1 / IN4 / IN8 | B1 / B2 / B3 / B+ 누적 셀 노드 |
+| PC1 / PC0 / PC3 / PC4 | ADC1 IN11 / IN10 / IN13 / IN14 | NTC 1~4 |
+| PC2 | ADC1 IN12 | ACS712-05B 전류 센서 |
+| Internal CH17 | ADC1 Vrefint | VDDA 보정 |
+| PB6 / PB7 | I2C1 SCL / SDA | INA226, 7-bit address `0x40` |
+| PA8 / PC9 | I2C3 SCL / SDA | SSD1306 OLED, address `0x3C` |
+| PB8 / PB9 | CAN1 RX / TX | SN65HVD230 |
+| PA2 / PA3 | USART2 TX / RX | ST-Link VCP, 115200 8N1 |
+| PA5 | GPIO Output | Power / Run LED |
+| PC6 | GPIO Output | Charge / Relay LED |
+| PC8 | GPIO Output | Fault LED |
+| PB5 | GPIO Output | BMS 충전 차단 릴레이 |
 
-| CAN ID  | 실제 용도                       |
-| ------- | --------------------------- |
-| `0x200` | EVSE 상태, 릴레이, 연결 상태, E-Stop |
-| `0x201` | 충전 시작·중지 요청                 |
-| `0x202` | EVSE Fault                  |
-| `0x203` | BMS OTA 진입 요청 — 현재 미지원      |
-| `0x205` | 보호 임계값 변경                   |
+### 연결 시 주의사항
 
-### BMS → EVSE 송신 ID
-
-| CAN ID          | 용도                        |
-| --------------- | ------------------------- |
-| `0x100 ~ 0x105` | BMS 상태·측정값·Fault·명령 응답 전송 |
-
-주기 송신 프레임은 다음과 같이 나눴습니다.
-
-| 실행 주기  | CAN ID           |
-| ------ | ---------------- |
-| 100ms  | `0x100`, `0x103` |
-| 500ms  | `0x101`, `0x102` |
-| 명령·상황별 | 나머지 상태·응답 프레임    |
-
-### 충전 요청 처리
-
-EVSE의 충전 요청과 장치 상태는 서로 다른 CAN ID로 전달됩니다.
-
-* `0x200`: EVSE 연결, 릴레이, E-Stop 등의 상태
-* `0x201`: 충전 시작 또는 중지 명령
-* `0x202`: EVSE 자체 Fault 정보
-
-BMS는 각 프레임에서 필요한 정보를 갱신하고, FSM 전이 시 충전 요청·연결·E-Stop·Fault·CAN 링크 조건을 종합적으로 확인합니다.
-
-### CAN DLC 검증
-
-수신 프레임은 CAN ID만 확인하지 않고, 해당 ID에 정의된 DLC가 맞는지도 검사합니다.
-
-```text
-CAN ID 확인
-    → 예상 DLC 확인
-    → 데이터 범위 확인
-    → 유효한 프레임만 상태에 반영
-```
-
-길이가 잘못된 프레임을 정상 명령으로 해석해 상태값이 잘못 갱신되는 것을 방지합니다.
-
-### CAN Timeout과 Stale Request 제거
-
-마지막 정상 CAN 수신 시각을 저장하고, 일정 시간 동안 새로운 메시지가 들어오지 않으면 링크가 끊긴 것으로 판단합니다.
-
-```text
-CAN 메시지 미수신
-    → link_ok = 0
-    → 이전 charge_req 제거
-    → 충전 가능한 FSM 상태 이탈
-    → charge_permit 해제
-    → Relay OFF
-```
-
-통신이 복구된 후에도 이전 `charge_req`를 재사용하지 않습니다. 새로운 `0x201` 충전 요청을 수신해야 다시 충전 절차를 시작할 수 있습니다.
-
-### BMS OTA 요청 처리
-
-BMS는 `0x203`으로 OTA 진입 요청을 받을 수 있지만, 현재 BMS Bootloader와 OTA 적용 기능은 구현되어 있지 않습니다.
-
-따라서 요청을 무시하거나 OTA가 가능한 것처럼 처리하지 않고, 명시적으로 `Not Supported` 응답을 반환합니다.
-
-```text
-EVSE → BMS : CAN 0x203 OTA 진입 요청
-BMS → EVSE : Not Supported 응답
-```
-
-### CAN을 통한 보호 임계값 변경
-
-EVSE는 `0x205`를 이용해 다음 보호 임계값의 변경을 요청할 수 있습니다.
-
-* 셀 과전압 기준
-* 과전류 기준
-* 과온 기준
-
-수신한 값을 그대로 적용하지 않고, 펌웨어에서 정의한 안전 범위 안에 있는 값만 사용하도록 제한합니다.
-
-```text
-0x205 수신
-    → DLC 검증
-    → 요청값 해석
-    → 허용 가능한 안전 범위 확인
-    → 유효한 설정만 적용
-    → 처리 결과 응답
-```
-
-원격 명령으로 보호 기준이 과도하게 완화되는 것을 방지하기 위한 처리입니다.
+- 셀 ADC는 각 누적 노드를 100 kΩ / 20 kΩ 분압기로 측정합니다. 배터리 연결 전에 분압비와 GND를 확인해야 합니다.
+- INA226과 OLED는 각각 I2C1, I2C3에 분리되어 있습니다.
+- SN65HVD230은 3.3 V로 구동하고 `Rs`는 GND에 연결합니다. 두 노드는 공통 GND가 필요합니다.
+- CAN 양 끝에 120 Ω 종단을 사용합니다. 전원 OFF 상태에서 CANH–CANL이 약 60 Ω이면 정상입니다.
+- `CFG_RELAY_ACTIVE_HIGH`가 실물 릴레이와 반대면 부팅 직후 접점이 닫힐 수 있습니다. 전력 연결 전에 무부하 상태에서 극성을 검증해야 합니다.
+- ACS712는 PC2에 직접 연결되므로 어떤 상태에서도 ADC 입력이 VDDA를 넘지 않도록 해야 합니다.
 
 ---
 
-## 🔌 릴레이 Fail-safe 제어
+## 🧪 Verification & Troubleshooting
 
-충전 경로는 세 단계로 보호합니다.
+### 진단 인터페이스
 
-| 보호 계층   | 구성                  | 역할                      |
-| ------- | ------------------- | ----------------------- |
-| Layer 1 | 4S Protection Board | MCU와 독립적인 셀 단위 물리 보호    |
-| Layer 2 | BMS Relay, PB5      | BMS 판단에 따른 충전 경로 차단     |
-| Layer 3 | EVSE Relay          | BMS 충전 허가를 반영한 전원 경로 제어 |
+USART2를 115200 baud, 8-N-1로 열면 한 글자 명령을 즉시 처리합니다.
 
-BMS Relay에는 Normally Open 접점을 사용했습니다. MCU 초기화 전, BMS 전원 상실 또는 유효한 ON 출력이 없는 상황에서는 충전 경로가 개방됩니다.
+| 명령 | 기능 |
+| --- | --- |
+| `h` | 명령 목록과 릴레이·CAN 상태 |
+| `s` | 부팅 POST 재실행 |
+| `v` | ADC raw, 핀 전압, VDDA, 셀 노드, NTC dump |
+| `k` / `d` / `x` | 셀 노드 보정 / 보정값 출력 / 초기화 |
+| `c` | ACS712 무전류 offset 재보정 |
+| `i` | INA226 재초기화와 즉시 측정 |
+| `b` | I2C1·I2C3 bus recovery와 scan |
+| `t` | CAN TX/RX frame trace toggle |
+| `g` | 충전 진입 조건 snapshot |
+| `l` | 상태 LED mute toggle |
 
-### 릴레이 출력 함수의 직접 확인 조건
+### 문제 해결과 설계 결정
 
-실제 릴레이 출력 단계에서는 다음 두 조건을 직접 확인합니다.
+| 문제 | 원인 | 해결 |
+| --- | --- | --- |
+| 인접 셀 전압이 비정상적으로 커지거나 음수가 됨 | 누적 노드 한 채널의 실제 분압비 불일치가 차분 결과에 전파 | 채널별 분압 상수와 Q16 gain을 분리하고 ±25% calibration guard 적용 |
+| INA226 전류가 약 ±819 mA에서 포화 | R100 0.1 Ω 션트의 측정 범위 한계 | 포화 flag를 검출하고 ACS712 전류로 대체, 두 센서 차이는 Fault로 감시 |
+| 순간 노이즈로 Fault 진입 | 단일 ADC sample을 즉시 보호 판단에 사용 | 16회 ADC 평균, 3-sample Fault 확정, 진입·해제 임계값 분리 |
+| CAN은 송신하지만 BMS가 `LINK_TIMEOUT` 진입 | 상대 CAN 비활성, bitrate·종단·GND·트랜시버 설정 문제 | 부팅 bitrate self-check, TEC/REC/LEC 통계, frame trace로 계층별 확인 |
+| 릴레이 동작 순간 상태 해석이 어려움 | 측정·판단·출력·송신 로그의 시점 불일치 | 개폐 전후 ADC/CAN/Fault 변화를 남기는 relay window trace 추가 |
+| I2C 장치가 부팅 후 응답하지 않음 | SDA stuck 또는 장치 초기화 실패 | bus recovery, address scan, 장치 재초기화 명령 제공 |
+| CAN 연결은 살아 있지만 충전 상태로 가지 않음 | heartbeat와 charge request, connector, E-Stop 조건을 혼동 | `g` snapshot으로 각 조건을 분리 출력하고 FSM 진입 조건을 명시화 |
+
+### 권장 검증 순서
+
+1. 배터리와 충전 전원을 분리한 상태에서 GPIO 초기값과 릴레이 극성을 확인합니다.
+2. 콘솔 `s`, `v`로 VDDA, ADC 포화, 누적 셀 노드 순서와 NTC 채널을 확인합니다.
+3. 무전류 상태에서 `c`, `i`로 ACS712와 INA226의 영점·극성을 확인합니다.
+4. OLED와 I2C 주소를 확인하고 필요하면 `b`로 두 bus를 복구·scan합니다.
+5. 두 CAN 노드를 연결하고 `t`와 1초 통계로 TX/RX, TEC/REC, DLC를 확인합니다.
+6. `g`로 충전 요청·커넥터·E-Stop·링크 조건을 확인한 뒤 무부하 릴레이 시험을 수행합니다.
+7. 마지막으로 제한된 전압·전류 조건에서 Fault → Permit OFF → Relay OPEN 순서를 검증합니다.
+
+---
+
+## 📊 Implementation Results
+
+| 항목 | 결과 |
+| --- | --- |
+| BMS Bring-up | `S1`, `S1B`, `S2~S8` 전체 활성화 |
+| BMS Sensor Path | Cell ADC, INA226, ACS712, NTC 실측 경로 활성화 |
+| Local I/O | SSD1306 OLED, 3색 LED, PB5 릴레이 활성화 |
+| BMS Build | Debug clean build 완료, `.elf` / `.map` 생성 |
+| FLASH | 59,576 B / 512 KiB, **11.36%** |
+| RAM | 4,352 B / 128 KiB, **3.32%** |
+| CAN Integration | F446RE BMS ↔ F429ZI EVSE 실보드 양방향 링크 확인 |
+| OTA Reference | STM32F429ZI `0.1.0 → 0.2.0` LwM2M OTA E2E 검증 |
+
+BMS 빌드 산출물은 다음 위치에 있습니다.
 
 ```text
-charge_permit
-&& (FSM == CHARGE_READY || FSM == CHARGING)
+Embedded_Lifecycle_Device_BMS_Final/build/Debug/
+├── Embedded_Device_Lifecycle_BMS.elf
+└── Embedded_Device_Lifecycle_BMS.map
 ```
 
-EVSE 요청, 연결 상태, E-Stop, CAN 링크 상태를 릴레이 함수에서 모두 다시 검사하는 구조는 아닙니다.
+OTA E2E 결과는 BMS 자체 업데이트가 아니라 STM32F429ZI EVSE reference 경로의 결과입니다. BMS OTA는 현재 명시적으로 미지원 상태입니다.
 
-각 조건은 FSM 전이 과정에서 검증하며, 릴레이 출력 단계에서는 `charge_permit`과 현재 FSM이 충전 가능한 상태인지를 최종 확인합니다.
+---
 
-> 릴레이 출력 단계에서는 `charge_permit`과 FSM 상태를 다시 확인하며, EVSE 요청·연결·E-Stop·CAN 링크 조건은 FSM 전이 과정에서 검증합니다.
+## 🚀 Build & Run
 
-### 최종 충전 흐름
+이 저장소는 여러 독립 target을 한곳에 모은 workspace입니다. 루트에는 통합 `CMakeLists.txt`가 없으므로 빌드할 프로젝트 디렉터리로 이동해야 합니다.
+
+### BMS Build
+
+요구 도구:
+
+- CMake 3.22 이상
+- Ninja
+- GNU Arm Embedded Toolchain (`arm-none-eabi-gcc`)
+- 선택: STM32CubeMX 또는 STM32 VS Code Extension
+
+```powershell
+cd Embedded_Lifecycle_Device_BMS_Final
+cmake --preset Debug
+cmake --build --preset Debug
+```
+
+Release build:
+
+```powershell
+cmake --preset Release
+cmake --build --preset Release
+```
+
+생성된 `Embedded_Device_Lifecycle_BMS.elf`를 ST-Link와 STM32 지원 도구로 NUCLEO-F446RE에 program합니다.
+
+### 기본 실행 순서
+
+1. 셀 분압 회로, INA226, ACS712, NTC, OLED, CAN transceiver와 릴레이를 연결합니다.
+2. 전력 경로를 분리한 상태에서 BMS firmware를 flash합니다.
+3. ST-Link VCP를 115200 8-N-1로 열고 자동 POST 결과를 확인합니다.
+4. `v`, `c`, `i`로 전압·전류 센서를 먼저 검증합니다.
+5. EVSE CAN 노드를 연결하고 `t`를 켜 양방향 frame을 확인합니다.
+6. `g`로 충전 진입 조건을 확인한 뒤 무부하 릴레이 시험을 수행합니다.
+7. 모든 보호 동작을 확인한 후에만 제한된 전원 조건에서 통합 시험합니다.
+
+> EVSE 없이 BMS 한 노드만 CAN에 연결하면 ACK를 제공할 상대가 없어 TEC가 증가하고 Bus-Off에 진입할 수 있습니다. 이는 단독 노드 시험에서 정상적인 CAN 동작입니다.
+
+각 하위 프로젝트의 상세 빌드·실행 방법은 해당 문서를 참고하십시오.
+
+- [BMS 상세 README](Embedded_Lifecycle_Device_BMS_Final/README.md)
+- [EVSE Bootloader README](EVSE_BOOT-main/README.md)
+- [OTA/Wi-Fi Package README](OTA-Package-stm32-main/README.md)
+- [OTA Platform Architecture](ota-platform-main/ARCHITECTURE.md)
+- [OTA Platform Development Status](ota-platform-main/DEVELOPMENT_STATUS.md)
+
+---
+
+## 📁 Repository Guide
 
 ```text
-EVSE 상태·요청 수신
-    → 연결·E-Stop·CAN 링크 확인
-    → BMS Critical Fault 확인
-    → 충전 가능한 FSM 상태 진입
-    → charge_permit 확인
-    → PB5 Relay ON
+Final/
+├── README.md
+├── Embedded_Lifecycle_Device_BMS_Final/  # 직접 담당: BMS 전체 firmware
+│   ├── BMS/
+│   │   ├── app/                          # Scheduler, Fault, SOC, FSM, CAN, UI
+│   │   ├── dev/                          # Cell ADC, INA226, ACS712, NTC, OLED, LED
+│   │   ├── hw/                           # HAL wrapper: ADC, I2C, UART, GPIO, Tick
+│   │   └── common/                       # Types, thresholds, pin/config, bring-up
+│   ├── Core/                             # CubeMX entry and generated integration
+│   ├── Drivers/                          # STM32 HAL / CMSIS
+│   └── CMakeLists.txt
+│
+├── EVSE-Application-main/                # CAN protocol 대조용 EVSE snapshot
+├── EVSE_BOOT-main/                       # UART 기반 EVSE Bootloader
+├── OTA-Package-stm32-main/               # EVSE용 OTA/Wi-Fi add-on package
+└── ota-platform-main/                    # LwM2M server, clients, OTA E2E reference
 ```
 
-Critical Fault가 발생하거나 충전 불가 상태로 전이하면 `charge_permit`이 해제되고 릴레이가 개방됩니다.
+### BMS 핵심 파일
+
+| 파일 | 역할 |
+| --- | --- |
+| [`bms_app.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_app.c) | 블랙보드, 주기 스케줄, 릴레이, 콘솔, POST |
+| [`bms_fault.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_fault.c) | Fault 확정·해제·히스테리시스와 Permit 계산 |
+| [`bms_state.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_state.c) | BMS 6-state FSM |
+| [`bms_soc.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_soc.c) | OCV + 쿨롱 카운팅 SOC |
+| [`bms_can.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_can.c) | CAN 송수신, filter, trace, 오류 통계 |
+| [`bms_link.c`](Embedded_Lifecycle_Device_BMS_Final/BMS/app/bms_link.c) | CAN payload packing과 protocol dispatch |
+| [`bms_cfg.h`](Embedded_Lifecycle_Device_BMS_Final/BMS/common/bms_cfg.h) | 임계값, 센서 상수, task 주기, CAN ID |
+| [`bms_types.h`](Embedded_Lifecycle_Device_BMS_Final/BMS/common/bms_types.h) | 공용 상태·Fault·블랙보드 정의 |
+| [`bringup.h`](Embedded_Lifecycle_Device_BMS_Final/BMS/common/bringup.h) | S1~S8 단계별 하드웨어 활성화 |
+
+> `EVSE-Application-main/`은 BMS 담당자가 CAN 프레임 계약을 대조하기 위해 보관한 snapshot입니다. 실제 통합 보드에 사용한 최신 EVSE firmware는 EVSE 담당자의 별도 tree에서 관리됩니다. 이 폴더에서는 `can_protocol.h/.c`의 frame map과 validation을 기준으로 봅니다.
 
 ---
 
-## 🖥️ OLED·LED 상태 표시
+## ⚠️ Known Limitations
 
-### OLED 표시 항목
-
-OLED에는 다음 정보가 표시됩니다.
-
-* 현재 FSM
-* `charge_permit`
-* BMS 릴레이 상태
-* Cell 1~4 전압
-* Pack 전압
-* 선택된 대표 전류
-* NTC 4채널 중 최고 온도
-* SOC
-* 셀 전압 편차
-* 현재 Fault
-* VDDA
-
-INA226와 ACS712의 전류를 각각 별도 항목으로 표시하지 않습니다. INA226 정상 여부와 포화 상태를 반영해 선택된 **대표 전류**를 표시합니다.
-
-CAN 링크 상태 역시 OLED의 독립 항목으로 표시하지 않고, Fault와 FSM 및 콘솔 로그를 통해 확인합니다.
-
-### 3색 상태 LED
-
-| 상태       | 표시 내용                   |
-| -------- | ----------------------- |
-| POWER    | BMS 전원 및 기본 동작 상태       |
-| CHARGING | 충전 가능한 상태 및 릴레이 동작      |
-| FAULT    | Critical Fault 또는 보호 상태 |
-
-OLED는 상세 측정값을 확인하는 용도로 사용하고, LED는 현재 상태를 빠르게 구분하는 용도로 사용했습니다.
+- 현재 BMS는 `CFG_DEMO_MODE=1`이며 과전류 기준 1 A, SOC 기준 용량 50 mAh입니다. 실제 배터리에 적용하기 전에 대상 팩 사양으로 반드시 변경해야 합니다.
+- BMS 자체 OTA는 구현되어 있지 않으며 `0x203` 요청을 거부합니다.
+- 셀 ADC calibration과 원격 과온 임계값은 RAM에만 유지되어 reset 후 기본값으로 돌아갑니다.
+- INA226 모듈의 기본 R100 0.1 Ω shunt는 약 ±819 mA에서 포화됩니다. ACS712 대체 경로를 포함해 실제 범위와 극성을 검증해야 합니다.
+- `IMBALANCE`는 경고만 제공하며 셀 balancing 회로를 직접 제어하지 않습니다.
+- BMS 릴레이 상태와 개별 NTC 4채널 값은 현재 CAN payload에 포함되지 않습니다.
+- 현재 검증은 실보드, UART log와 CAN trace 중심이며 host unit-test framework와 lint 설정은 포함되어 있지 않습니다.
+- OTA reference의 CRC32는 전송 무결성 검사용이며 firmware signature, anti-rollback, 설치 중 전원 차단 rollback은 제품화 단계의 추가 항목입니다.
 
 ---
 
-## 🔧 통신 및 주변장치 안정화
+## 📄 License
 
-### ① CAN Bus-Off 자동 복구
-
-CAN 통신 오류가 누적되어 Bus-Off 상태로 진입할 수 있으므로 STM32 CAN 설정에서 자동 복구 기능을 활성화했습니다.
-
-```text
-CAN 오류 누적
-    → Error-Passive
-    → Bus-Off
-    → 자동 복구 절차
-    → CAN 통신 재개
-```
-
-자동 복구와 별개로 BMS 제어 로직은 통신 단절 구간에서 `charge_req`를 제거하고 릴레이를 차단합니다. CAN 주변장치가 복구되더라도 충전은 새로운 요청을 받은 후에만 재개됩니다.
-
-### ② I2C 버스 복구
-
-INA226 또는 OLED 통신 중 I2C 버스가 비정상 상태에 머무는 경우를 대비해 버스 복구 기능을 구현했습니다.
-
-* I2C 장치 응답 이상 확인
-* 버스 복구 수행
-* 연결된 I2C 장치 스캔
-* INA226와 OLED 응답 여부 확인
-* 복구 결과 콘솔 출력
-
-특정 I2C 장치의 오류로 전체 BMS 루프가 멈추지 않도록 진단과 복구 경로를 분리했습니다.
-
-### ③ 릴레이 전환 진단 로그
-
-릴레이가 ON 또는 OFF로 전환되는 순간에는 ADC와 CAN 상태를 함께 기록합니다.
-
-```text
-Relay 전환 시점
-    → 셀·팩 전압
-    → 대표 전류
-    → FSM
-    → Fault
-    → charge_req / charge_permit
-    → CAN 상태
-```
-
-릴레이가 예상과 다르게 동작했을 때 전환 직전의 측정값과 통신 상태를 함께 확인할 수 있도록 했습니다.
-
----
-
-## 🧪 동작 검증
-
-| 검증 항목          | 확인 내용                                        |
-| -------------- | -------------------------------------------- |
-| 초기화            | 부팅 직후 PB5 Relay OFF 및 `SELF_CHECK` 수행        |
-| 정상 충전          | 유효한 EVSE 요청과 BMS 정상 상태에서 Relay ON            |
-| 충전 중지          | EVSE 중지 요청 수신 후 충전 상태 해제                     |
-| Critical Fault | Fault 확정 시 `charge_permit = 0`, Relay OFF    |
-| Warning        | 셀 불균형 Warning 발생 시 상태 표시, Critical Fault와 분리 |
-| Fault 복구       | 정상 범위와 히스테리시스 조건 3초 유지 후 복귀                  |
-| CAN Timeout    | 이전 `charge_req` 제거 및 Relay OFF               |
-| CAN 링크 복구      | 새로운 `0x201` 요청을 수신해야 충전 재개                   |
-| 잘못된 DLC        | 프레임을 상태값에 반영하지 않고 폐기                         |
-| BMS OTA 요청     | `0x203` 수신 후 `Not Supported` 응답              |
-| 임계값 변경         | `0x205` 요청값의 안전 범위 검증 후 적용                   |
-| INA226 포화      | 보호 판단용 전류를 ACS712로 전환                        |
-| ADC 정확도        | DMA 16회 평균 및 VREFINT 기반 VDDA 보정              |
-| I2C 이상         | 버스 복구 및 장치 스캔 수행                             |
-| Bus-Off        | 자동 복구 후 CAN 통신 재개 확인                         |
-| 상태 출력          | OLED·LED·CAN·콘솔 상태 일치 확인                     |
-
----
-
-## 🛠️ 트러블슈팅
-
-### ① 4S 셀 전압 및 Pack 전압 측정 이상
-
-| 구분 | 내용                                                |
-| -- | ------------------------------------------------- |
-| 증상 | 통합 테스트 중 Cell 3·4 전압이 비정상적으로 계산되고 Pack 전압이 0V로 표시 |
-| 확인 | 배터리 단품 전압을 멀티미터로 측정했을 때 정상                        |
-| 분석 | 셀별 계산값과 함께 P1~P4 누적 노드 전압을 순서대로 확인                |
-| 원인 | 배터리 홀더 접점이 셀 단자와 일정하게 접촉하지 않아 누적 전압 측정점이 불안정      |
-| 해결 | 배터리를 분리한 뒤 재장착하고 홀더 접점과 납땜 연결 상태 확인               |
-| 결과 | P1~P4 누적 전압과 Cell 1~4 계산값 정상화                     |
-
-누적 전압 측정 방식에서는 앞쪽 셀의 접점 하나가 불안정해도 이후 셀 계산값이 함께 틀어집니다. 최종 셀 전압만 확인하지 않고 ADC 원시값과 누적 노드를 순서대로 확인해 문제 구간을 좁혔습니다.
-
-### ② EVSE–BMS CAN 통신 중단
-
-| 구분    | 내용                                                        |
-| ----- | --------------------------------------------------------- |
-| 증상    | CAN 송신은 수행되지만 수신 응답과 ACK가 발생하지 않음                         |
-| 로그    | ACK Error, Error-Passive, `TEC = 136`, `LINK_TIMEOUT` 발생  |
-| 1차 확인 | BMS CAN 코드, 배선, 커넥터 및 종단저항 점검                             |
-| 원인    | EVSE 시스템 클럭 변경 후 CAN Bit Timing이 다시 계산되지 않아 약 533kbps로 동작 |
-| 해결    | EVSE CAN Prescaler와 Time Segment 재계산                      |
-| 결과    | EVSE와 BMS의 실제 CAN 속도를 500kbps로 통일하고 정상 송수신 확인             |
-
-설정 화면에 입력한 목표 속도만 비교하지 않고, 실제 Peripheral Clock과 Prescaler·Time Segment 조합을 기준으로 CAN 속도를 다시 계산했습니다.
-
----
-
-## 📚 주요 소스 파일
-
-| 파일                                      | 주요 역할                                     |
-| --------------------------------------- | ----------------------------------------- |
-| `[bms_app.c](BMS/app/bms_app.c)`        | 100ms·500ms·1000ms 스케줄러와 전체 실행 흐름         |
-| `[bms_can.c](BMS/app/bms_can.c)`        | CAN ID 처리, DLC 검증, 명령 응답, OTA 미지원 응답      |
-| `[bms_state.c](BMS/app/bms_state.c)`    | 6상태 FSM과 충전 상태 전이                         |
-| `[bms_fault.c](BMS/app/bms_fault.c)`    | Fault 확인 카운트, 히스테리시스, Warning·Critical 구분 |
-| `[bms_ui.c](BMS/app/bms_ui.c)`          | OLED와 3색 LED 표시                           |
-| `[bms_cfg.h](BMS/common/bms_cfg.h)`     | CAN ID와 보호 임계값 설정                         |
-| `[bms_types.h](BMS/common/bms_types.h)` | FSM, Fault, Warning, BMS 데이터 구조           |
-
----
-
-## ✅ 핵심 구현 요약
-
-* STM32F446RE 기반 Bare-metal 4S BMS 구현
-* ADC DMA 16회 오버샘플링 및 VREFINT 기반 VDDA 보정
-* 누적 노드 전압 차분을 이용한 Cell 1~4 전압 계산
-* INA226·ACS712 이중 전류 계측
-* INA226 포화 시 ACS712로 보호 전류 경로 전환
-* NTC 4채널 중 최고 온도를 이용한 과온 보호
-* SOC 계산 및 OLED·CAN 전송
-* 6상태 FSM 기반 충전 시퀀스 제어
-* Fault 3회 연속 확인과 해제 히스테리시스 적용
-* 일반 Fault 정상 상태 3초 유지 후 복구
-* Warning과 Critical Fault 분리
-* Critical Fault만 `charge_permit` 차단
-* EVSE–BMS CAN 500kbps 통신
-* CAN ID별 DLC 검증
-* CAN Timeout 시 이전 `charge_req` 제거
-* CAN Bus-Off 자동 복구
-* CAN `0x205` 기반 보호 임계값 변경 및 안전 범위 제한
-* CAN `0x203` BMS OTA 요청에 `Not Supported` 응답
-* PB5 Normally Open 릴레이 기반 Fail-safe 제어
-* I2C 버스 복구 및 장치 스캔
-* 릴레이 전환 시점 ADC·CAN 진단 로그
-* OLED를 통한 FSM·측정값·SOC·Fault·VDDA 표시
+STM32CubeMX 생성 코드와 HAL/CMSIS에는 STMicroelectronics의 각 라이선스가 적용되며, Wakaama 등 third-party 구성요소는 해당 디렉터리의 라이선스를 따릅니다. 프로젝트 사용자 코드의 배포 조건은 별도로 정해야 합니다.
